@@ -36,7 +36,7 @@ struct model {
     double T_CMB_0;
     double w0;
     double wa;
-
+    double model_MG;
     /* Do the simulation particles not have masses that vary with w_nu(a)? */
     int sim_neutrino_nonrel_masses;
     /* Does the simulation have a Hubble rate with Omega_nu(a) = constant? */

@@ -29,6 +29,11 @@
 #include "../include/cosmology_tables.h"
 #include "../include/units.h"
 #include "../include/strooklat.h"
+#include <gsl/gsl_math.h>
+#include <gsl/gsl_errno.h>
+#include <gsl/gsl_odeiv2.h>
+#include <gsl/gsl_sf.h>
+#include <gsl/gsl_spline.h> 
 
 
 double F_integrand(double x, void *params) {
@@ -49,17 +54,97 @@ double w_tilde(double a, double w0, double wa) {
     return (a - 1.0) * wa - (1.0 + w0 + wa) * log(a);
 }
 
-double E2(double a, double Omega_CMB, double Omega_ur, double Omega_nu,
-          double Omega_c, double Omega_b, double Omega_lambda, double Omega_k,
-          double w0, double wa) {
+struct df_params {
+    double Omega_CMB;
+	double Omega_ur;
+    double Omega_c;
+	double Omega_b;
+    double *Omega_nu_tot;
+    struct strooklat *spline;
+    struct model *m;
+    struct units *us;
+    struct physical_consts *pcs;
+};
 
+int dfunc (double a, const double y[], double f[], void *params_ptr) {
+	struct df_params *lparams = (struct df_params *) params_ptr;
+    struct strooklat *spline = lparams->spline;
+    struct model *m = lparams->m;
+    struct units *us = lparams->us;
+    struct physical_consts *pcs = lparams->pcs;
+
+	/* Pull down some constants */
+	const double Omega_CMB = lparams->Omega_CMB;
+	const double Omega_ur = lparams->Omega_ur;
+    const double Omega_c = lparams->Omega_c;
+	const double Omega_b = lparams->Omega_b;
+    const double h = m->h;
+    const char model_MG = m->model_MG;
+
+    /* Vector with neutrino densities */
+    double *Omega_nu_tot = lparams->Omega_nu_tot;
+    
+    /* Define further constants */
+    const double Omega_nu_a = strooklat_interp(spline, Omega_nu_tot, a);
+    const double Omega_m = Omega_c + Omega_b;
+    const double Omega_r = Omega_CMB + Omega_ur + Omega_nu_a;
+    const double H_0 = h * 100.0 * KM_METRES / MPC_METRES * us->UnitTimeSeconds;
+    const double H_0_2 = H_0 * H_0;
+
+    /* Density parameters */
     const double a_inv = 1.0 / a;
     const double a_inv2 = a_inv * a_inv;
-    const double E2 = (Omega_CMB + Omega_ur + Omega_nu) * a_inv2 * a_inv2 +
-                      (Omega_c + Omega_b) * a_inv2 * a_inv +
-                      Omega_k * a_inv2 +
-                      Omega_lambda * exp(3. * w_tilde(a, w0, wa));
-    return E2;
+    const double rho_m = 3.0 * H_0_2 * Omega_m * a_inv2 * a_inv;
+    const double rho_r = 3.0 * H_0_2 * Omega_r * a_inv2 * a_inv2;
+    const double p_r = rho_r / 3.0;
+    
+    /* Intermediate steps */
+    if (strcmp(model_MG,"fT") != 0) {
+        const double T0 = -6.0 * H_0_2;
+        const double b = 0.632;
+        const double half_on_b = 0.5 / b;
+        const double alpha = gsl_sf_lambert_W0(-(Omega_m + Omega_r) * 0.5 * exp(-0.5 / b) / b) + half_on_b;
+        const double T = -6.0 * y[0] * y[0];
+        const double T0_on_T_pow_b = pow(T0 / T, b);
+        const double exp_T0_on_T_pow_b_alpha = exp(T0_on_T_pow_b * alpha);
+        const double FT = -1.0 + exp_T0_on_T_pow_b_alpha * (1.0 - b * T0_on_T_pow_b * alpha);
+        const double FTT = (b * exp_T0_on_T_pow_b_alpha * T0_on_T_pow_b * alpha * (-1.0 + b + b * T0_on_T_pow_b * alpha)) / T;
+            
+        /* Final answer, dH/da */
+        f[0] = (-0.5 * (rho_m + rho_r + p_r) / (1.0 + FT + 2.0 * T * FTT)) / (a * y[0]);
+    } else if (strcmp(model_MG,"fTT") != 0) {
+        const double T0 = -6.0 * H_0_2;
+        const double T = -6.0 * y[0] * y[0];
+        const double b = -1.82;
+        const double lambda = (1-Omega_m-Omega_r)/(Omega_m*(1-2*b));
+        const double rhor0 = rho_r/(a_inv2 * a_inv2);
+        const double rhom0 = rho_m/(a_inv2 * a_inv);
+        const double pow3b = pow(3,b);
+        const double Hpowb = pow((-(pow(y[0],2)/T0)),b);
+        const double pow1b = pow(2,(1 + b));
+        const double pow2b = pow(2,2+b);
+        const double bsquared = b * b;
+        
+        f[0] =         -0.5*((3*a*rhom0 + 4*rhor0)*y[0]*
+          (-1 - pow(6,b)*lambda*Hpowb + pow2b*pow3b*b*lambda*Hpowb))/
+        (a*(3*pow(a,4)*pow(y[0],2) - pow(6,b)*pow(a,4)*b*lambda*Hpowb + 
+            pow1b*pow3b*pow(a,4)*bsquared*lambda*Hpowb + 
+            pow1b*pow3b*a*b*lambda*rhom0*Hpowb - 
+            pow2b*pow3b*a*bsquared*lambda*rhom0*Hpowb + 
+            pow1b*pow3b*b*lambda*rhor0*Hpowb - 
+            pow2b*pow3b*bsquared*lambda*rhor0*Hpowb + 
+            pow(2,b)*pow(3,1+b)*pow(a,4)*lambda*pow(y[0],2)*Hpowb));
+    }
+
+	return GSL_SUCCESS;
+}
+
+double E2(double a_input, double Omega_CMB, double Omega_ur, double Omega_nu,
+          double Omega_c, double Omega_b, double Omega_lambda, double Omega_k,
+          double w0, double wa, struct model *m, struct units *us, 
+          struct physical_consts *pcs) {
+
+    return 0;
 }
 
 void integrate_cosmology_tables(struct model *m, struct units *us,
@@ -262,13 +347,96 @@ void integrate_cosmology_tables(struct model *m, struct units *us,
         }
     }
 
-    /* Now, create a table with the Hubble rate */
+    /* Now, prepare the calculation of the Hubble rate */
+    struct df_params Ea_ode_params;
+    int j = 0;
+    
+    gsl_odeiv2_system ode_system;
+    Ea_ode_params.Omega_CMB = Omega_CMB;
+    Ea_ode_params.Omega_ur = Omega_ur;
+    Ea_ode_params.Omega_c = Omega_c;
+    Ea_ode_params.Omega_b = Omega_b;
+    Ea_ode_params.Omega_nu_tot = Omega_nu_tot;
+    Ea_ode_params.spline = &spline;
+    Ea_ode_params.m = m;
+    Ea_ode_params.us = us;
+    Ea_ode_params.pcs = pcs;
+
+    ode_system.function = dfunc;
+    ode_system.dimension = 1;
+    ode_system.params = &Ea_ode_params;
+    
+    /* We can solve for y[0] by starting from H = H_0 at a = 1 */
+    /* Hence, we need to solve forwards for a > 1 and backwards for a < 1 */
+    const double step_size = 1e-8;
+    gsl_odeiv2_driver *drv_forward = gsl_odeiv2_driver_alloc_y_new (&ode_system, gsl_odeiv2_step_rkf45, step_size, abs_tol, abs_tol);
+    gsl_odeiv2_driver *drv_backward = gsl_odeiv2_driver_alloc_y_new (&ode_system, gsl_odeiv2_step_rkf45, -step_size, abs_tol, abs_tol);
+    
+    double a_integrate = 1.0;
+    double H_integrate = H_0;
+    int status;
+    int begin_forward_index = 0;
+    
+    /* Forwards first, solving y[0] for all a > 1 */
     for (int i=0; i<size; i++) {
-        double Omega_nu_a = strooklat_interp(&spline, Omega_nu_tot, tab->avec[i]);
-        E2a[i] = E2(tab->avec[i], Omega_CMB, Omega_ur, Omega_nu_a, Omega_c,
-                       Omega_b, Omega_lambda, Omega_k, w0, wa);
-        tab->Hvec[i] = sqrt(E2a[i]) * H_0;
+        double a_next = tab->avec[i];
+        if (a_next < 1) {
+            begin_forward_index++;
+            continue;
+        }
+        
+        status = gsl_odeiv2_driver_apply(drv_forward, &a_integrate, a_next, &H_integrate);
+        if (status != GSL_SUCCESS) {
+            printf("Error: status = %d \n", status);
+            break;
+        }
+        tab->Hvec[i] = H_integrate;
+        // printf("%d %g %g\n", i, a_next, tab->Hvec[i]);
     }
+    
+    // printf("First a after today is %d %g\n", begin_forward_index, tab->avec[begin_forward_index]);
+    
+    /* Now, reset the state variables */
+    a_integrate = 1.0;
+    H_integrate = H_0;
+    
+    /* And integrate backwards, solving y[0] for all a < 1 */
+    for (int i=begin_forward_index-1; i>=0; i--) {
+        double a_next = tab->avec[i];        
+        status = gsl_odeiv2_driver_apply(drv_backward, &a_integrate, a_next, &H_integrate);
+        if (status != GSL_SUCCESS) {
+            printf("Error: status = %d \n", status);
+            break;
+        }
+        tab->Hvec[i] = H_integrate;
+        // printf("%d %g %g\n", i, a_next, tab->Hvec[i]);
+    }
+    
+    // exit(1);
+
+    // for (int i=0; i<size; i++) {
+    //     double a_next = tab->avec[size - i - 1];
+    //     double Omega_nu_a = strooklat_interp(&spline, Omega_nu_tot, tab->avec[size - i - 1]);
+    // 
+    //     if (a_next > 1) continue;
+    // 
+    //     printf("%g %g\n", a_integrate, a_next);
+    // 
+    //     Ea_ode_params.Omega_nu = Omega_nu_a;
+    //     status = gsl_odeiv2_driver_apply (drv, &a_integrate, a_next, &H_integrate);
+    //     if (status != GSL_SUCCESS) {
+    //         printf("Error: status = %d \n", status);
+    //         break;
+    //     }
+    //     tab->Hvec[size-i-1] = H_integrate;
+    // } 
+
+    // /* Now, create a table with the Hubble rate */
+    // for (int i=0; i<size; i++) {
+    //     E2a[i] = E2(tab->avec[i], Omega_CMB, Omega_ur, Omega_nu_a, Omega_c,
+    //                    Omega_b, Omega_lambda, Omega_k, w0, wa, m, us, pcs);
+    //     tab->Hvec[i] = sqrt(E2a[i]) * H_0;
+    // }
 
     /* Now, differentiate the Hubble rate */
     for (int i=0; i<size; i++) {
